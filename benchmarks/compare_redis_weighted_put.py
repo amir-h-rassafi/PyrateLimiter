@@ -2,10 +2,10 @@
 
 Example:
     # Redis is limited to one CPU and 512 MiB by cgroups; pin the benchmark
-    # to a different CPU. Adjust CPU IDs to those available on your host.
+    # to a separate physical core. Adjust CPU IDs to those available on your host.
     docker run -d --rm --name pyrate-bench-redis -p 6379:6379 \
-        --cpuset-cpus 0 --memory 512m --memory-swap 512m redis:7
-    taskset -c 1 uv run --group all python benchmarks/compare_redis_weighted_put.py \
+        --cpuset-cpus 0 --cpus 1 --memory 512m --memory-swap 512m redis:7
+    taskset -c 2 uv run --group all python benchmarks/compare_redis_weighted_put.py \
         --baseline /tmp/pyrate-master \
         --candidate /tmp/pyrate-candidate \
         --redis-url redis://localhost:6379 \
@@ -13,6 +13,8 @@ Example:
     docker stop pyrate-bench-redis
 
 Run on an otherwise idle Linux host. The comparison runs locally, outside CI.
+Use a dedicated Redis instance and trusted checkouts: workers execute code from
+both checkouts and delete their per-sample Redis keys.
 
 The key is reset before every sample, so this benchmark isolates weighted put
 latency. Window duration is reported independently from retained-set occupancy,

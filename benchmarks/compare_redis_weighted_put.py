@@ -1,6 +1,8 @@
 """Compare weighted RedisBucket put latency between two source checkouts.
 
 Example:
+    git worktree add --detach /tmp/pyrate-master <before-sha>
+    git worktree add --detach /tmp/pyrate-candidate <after-sha>
     # Redis is limited to one CPU and 512 MiB by cgroups; pin the benchmark
     # to a separate physical core. Adjust CPU IDs to those available on your host.
     docker run -d --rm --name pyrate-bench-redis -p 6379:6379 \

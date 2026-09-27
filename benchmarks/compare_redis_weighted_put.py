@@ -30,7 +30,7 @@ from pathlib import Path
 from time import perf_counter_ns
 from typing import Any
 
-DEFAULT_WEIGHTS = [1, 10, 100, 1000, 5000]
+DEFAULT_WEIGHTS = [10, 100, 1000, 5000]
 DEFAULT_ROUNDS = 5
 WINDOW_MS = 1_000
 

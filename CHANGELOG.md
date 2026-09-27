@@ -4,6 +4,146 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](http://semver.org/).
 
+## [4.5.0]
+
+Pluggable rate-limiting algorithms. Additive — no breaking public API changes;
+the default behaviour of every existing bucket is unchanged.
+
+### Added
+- **`GCRA` / `TokenBucket` algorithms, and `StateBucket` to run them.** These
+  keep a couple of numbers per key instead of one entry per consumed unit, so
+  storage does not grow with traffic and the wait is exact without any lookup.
+  `TokenBucket` *is* `GCRA` under a familiar name — one implementation, not two.
+
+  ```python
+  from pyrate_limiter import Duration, Limiter, Rate, StateBucket, TokenBucket
+
+  limiter = Limiter(StateBucket([Rate(5, Duration.SECOND, burst=10)], algorithm=TokenBucket()))
+  ```
+
+  Stores: `InMemoryStateStore`, `MultiprocessStateStore`, and `RedisStateStore`
+  (transition runs as a Lua script, so the read-modify-write is atomic across
+  clients; keys carry a TTL and need no `leak()`). For a 1000/minute limit at
+  saturation the Redis state is ~100 bytes against roughly 89 KB of sorted set.
+  GCRA's state is integer microseconds rather than fractional milliseconds:
+  accumulating a fractional emission interval onto an absolute timestamp loses
+  the low bits, which would reject the last unit of a full burst.
+- **`Rate(..., burst=N)`** — how many units may be spent at once. Read only by
+  the constant-state algorithms; defaults to `limit`, which is classic
+  token-bucket behaviour. `burst=1` is a perfectly smooth drip.
+- **`WallClock`** — epoch-millisecond clock, for state compared across machines
+  where a monotonic clock is meaningless. `RedisStateStore` defaults to it.
+- `limiter_factory.create_token_bucket_limiter()`.
+- **`FixedWindow` algorithm.** Counts within a wall-clock-aligned window that
+  resets every `interval`, rather than a rolling one. Pass it to any built-in
+  bucket: `InMemoryBucket(rates, algorithm=FixedWindow())`. Cheaper and coarser
+  than the default — up to `2 * limit` can pass across a boundary — and the
+  right choice for mirroring an upstream API that genuinely resets on the hour.
+  Works on all five backends.
+- Every built-in bucket now takes an `algorithm=` argument, defaulting to
+  `SlidingWindowLog()`. Existing code is unaffected.
+- `Decision` now carries `retry_after_ms` alongside the verdict, and `put()`
+  records it. `AbstractBucket.waiting()` reads that recording instead of
+  deriving the wait from storage a second time. Custom buckets that record
+  nothing keep working: `waiting()` falls back to the previous `peek()`-based
+  derivation.
+- `AbstractBucket.put_decision()` returns the full `Decision` for a put, so the
+  verdict and the retry-after arrive together rather than via the
+  `failing_rate` attribute plus a follow-up `waiting()` call.
+- `Algorithm`, `LogAlgorithm`, `Decision` and `SlidingWindowLog` are exported
+  from the package root.
+
+### Fixed
+- **Packaging**: the optional backends are now real, pip-installable extras.
+  `pip install "pyrate-limiter[all]"` — the command the README has always
+  documented — previously resolved to nothing: the project declared only PEP 735
+  `[dependency-groups]`, which pip cannot reach through extras syntax, so the
+  install emitted `WARNING: does not provide the extra 'all'` and then failed at
+  `import redis`. `redis`, `postgres`, `filelock` and `all` now all work.
+- **SQLiteBucket**: a successful `put()` now clears `failing_rate`. Every other
+  backend already did; SQLite left the last denial standing indefinitely.
+
+### Performance
+- **RedisBucket**: the Lua script returns the blocking item's timestamp with the
+  verdict, so a rate-limited request no longer needs a second `ZRANGE` round
+  trip to learn how long to wait — and the wait can no longer be computed
+  against a sorted set that moved in between.
+- **PostgresBucket**: the retry-after is resolved inside the same `EXCLUSIVE`
+  table lock as the check, removing both a round trip and that same race.
+- **SQLiteBucket**: likewise resolved inside `put()`'s existing lock hold, so
+  the background `Leaker` cannot delete rows between the verdict and the wait.
+- **InMemoryBucket** / **MultiprocessBucket**: the wait falls out of the bisect
+  `put()` already performs — no second scan, and no allocation on the admit path.
+
+### Documentation
+- The README and package description no longer describe the library as
+  implementing "the Leaky-Bucket algorithm". The default has always been a
+  sliding-window log; the leaky-bucket meter is now genuinely available as
+  `GCRA`, so the term is reserved for it.
+
+### Internal / Refactor
+- `StateAlgorithm` declares `redis_args(rates)` so a policy's Lua script and its
+  arguments stay a matched pair it owns. `RedisStateStore` passes them through
+  without inspecting them, rather than assuming GCRA's shape.
+- `Algorithm.max_weight(rate)` is the one place asking whether a weight can ever
+  be admitted — `rate.limit` for the window algorithms, `rate.burst` for GCRA.
+- `Algorithm` now has two sub-interfaces: `LogAlgorithm` (an entry per consumed
+  unit) and `StateAlgorithm` (a fixed tuple of numbers). `StateAlgorithm.step()`
+  must evaluate every rate before committing any of them, so a rate failing late
+  never leaves an earlier one debited.
+- Split `LogAlgorithm` out of `Algorithm` for policies whose state is a log of
+  timestamped items. `leak_bound()` and the new `blocking_offset()` /
+  `retry_after()` hooks live there; constant-state policies (token bucket, GCRA)
+  will not implement it.
+- The inclusive-window `+1` boundary correction now lives in exactly one place
+  (`SlidingWindowLog.retry_after`) instead of being inlined in `waiting()`.
+
+## [4.4.0]
+
+Bug-fix, scalability, and internal-refactor release. No public API changes
+(the new `AbstractBucket.is_async` attribute is additive).
+
+### Fixed
+- **InMemoryBucket**: guard the internal item list with a lock so the
+  background `Leaker` thread can no longer race `put`/`peek`/`leak`. This was a
+  data race in the default configuration (in-memory bucket + scheduled leak).
+  `MultiprocessBucket` aliases this lock to its shared cross-process lock. (#302)
+- **PostgresClock**: when the DB time query fails, fall back to local
+  **wall-clock** epoch time instead of monotonic time. The monotonic fallback
+  was ~5 orders of magnitude smaller than the stored epoch-ms timestamps and
+  would corrupt every window comparison and leak bound. (#302)
+- **Leaker**: make the background sync-leak worker restartable. Re-registering a
+  bucket after every bucket had been disposed previously raised
+  `RuntimeError: threads can only be started once`. (#302)
+- Keep `Limiter` picklable after the `InMemoryBucket` lock addition. (#302)
+
+### Performance & Scalability
+- **Limiter**: release the limiter lock during the synchronous blocking wait, so
+  a long wait on one key no longer serializes acquisitions for every other key
+  sharing the limiter. (#304)
+- **RedisBucket**: batch weighted `ZADD`s in bounded chunks inside the atomic
+  Lua script, lowering latency for high-weight puts. (#284)
+
+### Internal / Refactor
+- Unify the limiter's sync/async acquire plumbing into a single coroutine and
+  share the delay-step decision across the sync and async branches. (#303)
+- Add a declarative `is_async` bucket attribute so the `Leaker` no longer detects
+  async by executing a side-effecting `leak(0)` probe. `RedisBucket` still probes
+  because it may wrap either a sync or an async client. (#305)
+- Introduce an internal `Algorithm`/`Decision` seam (`SlidingWindowLog`) that the
+  built-in buckets delegate their per-rate admit decision and leak bound to —
+  the foundation for pluggable algorithms (e.g. GCRA, sliding-window-counter) in
+  a future release. (#307)
+
+### Documentation
+- Document that `RedisBucket` keeps one sorted-set member per consumed unit, and
+  that long-window / high-volume quotas may want a coarser counter-based backend
+  for bounded memory. (#284)
+
+### CI
+- The release workflow now also creates a GitHub Release for the pushed tag and
+  attaches the built `dist/*` artifacts, in addition to publishing to PyPI.
+
 ## [4.3.1]
 
 Performance and maintenance release. No API or behavior changes.

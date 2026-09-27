@@ -8,10 +8,11 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from inspect import isawaitable, iscoroutine
 from threading import Event, Thread
-from typing import Any, Awaitable, Dict, List, Optional, Type, Union
+from typing import Any, Awaitable, Dict, List, Optional, Tuple, Type, Union
 
 from ..clocks import AbstractClock, MonotonicClock
 from ..utils import enforce_rate_list
+from .algorithm import Decision, LogAlgorithm, SlidingWindowLog
 from .rate import Rate, RateItem
 
 logger = logging.getLogger("pyrate_limiter")
@@ -26,6 +27,17 @@ class AbstractBucket(ABC):
     _rates: List[Rate]
     failing_rate: Optional[Rate] = None
     _clock: AbstractClock = MonotonicClock()
+    # Default policy; every built-in bucket takes an ``algorithm=`` argument.
+    _algorithm: LogAlgorithm = SlidingWindowLog()
+    # (weight, absolute timestamp at which that weight fits), from the last
+    # put(). Absolute rather than a delay so it survives a later waiting() call.
+    _last_wait: Optional[Tuple[int, int]] = None
+    # Whether this bucket's operations return awaitables. ``None`` means
+    # "unknown" - the Leaker then probes once by calling ``leak(0)`` and
+    # checking for a coroutine. Built-in sync/async buckets declare this so no
+    # side-effecting probe is needed; ``RedisBucket`` leaves it ``None`` because
+    # it may wrap either a sync or an async client (issue #305).
+    is_async: Optional[bool] = None
 
     @property
     def rates(self) -> List[Rate]:
@@ -53,11 +65,59 @@ class AbstractBucket(ABC):
         """Retrieve current timestamp from the clock backend."""
         return self._clock.now()
 
+    def _record(self, item: RateItem, decision: Decision) -> bool:
+        """Store a put()'s verdict; return whether it was admitted.
+
+        Every put() path must funnel through here - including trivial admits -
+        so a previous denial can never stay visible.
+        """
+        self.failing_rate = decision.failing_rate
+
+        if decision.retry_after_ms is None:
+            self._last_wait = None
+        else:
+            self._last_wait = (item.weight, item.timestamp + decision.retry_after_ms)
+
+        return decision.allowed
+
+    def _recorded_wait(self, item: RateItem) -> Optional[int]:
+        """Last put()'s retry-after, if it was for this same weight."""
+        recorded = self._last_wait
+
+        if recorded is None or recorded[0] != item.weight:
+            return None
+
+        return max(0, recorded[1] - item.timestamp)
+
     @abstractmethod
     def put(self, item: RateItem) -> Union[bool, Awaitable[bool]]:
         """Put an item (typically the current time) in the bucket
         return true if successful, otherwise false
         """
+
+    def put_decision(self, item: RateItem) -> Union[Decision, Awaitable[Decision]]:
+        """``put()``, returning the full ``Decision`` rather than a bare bool.
+
+        Buckets need not override it; the default reads back what ``put()``
+        recorded. ``retry_after_ms`` is ``None`` for buckets that record none.
+        """
+        result = self.put(item)
+
+        if isawaitable(result):
+
+            async def _await_decision() -> Decision:
+                await result
+                return self._decision(item)
+
+            return _await_decision()
+
+        return self._decision(item)
+
+    def _decision(self, item: RateItem) -> Decision:
+        if item.weight == 0 or self.failing_rate is None:
+            return Decision()
+
+        return Decision(failing_rate=self.failing_rate, retry_after_ms=self._recorded_wait(item))
 
     @abstractmethod
     def leak(
@@ -90,25 +150,28 @@ class AbstractBucket(ABC):
 
         assert item.weight > 0, "Item's weight must > 0"
 
-        if item.weight > self.failing_rate.limit:
+        if item.weight > self._algorithm.max_weight(self.failing_rate):
             return -1
 
-        bound_item = self.peek(self.failing_rate.limit - item.weight)
+        recorded = self._recorded_wait(item)
 
-        if bound_item is None:
-            # NOTE: No waiting, bucket is immediately ready
-            return 0
+        if recorded is not None:
+            return recorded
 
-        def _calc_waiting(inner_bound_item: RateItem) -> int:
+        # Fallback for buckets written against the pre-4.5 contract, which
+        # record nothing: derive the wait with an extra lookup.
+        offset = self._algorithm.blocking_offset(self.failing_rate, item.weight)
+
+        if offset is None:
+            # Policy's wait does not depend on a stored entry (e.g. FixedWindow).
+            return self._algorithm.retry_after(self.failing_rate, item.timestamp, None)
+
+        bound_item = self.peek(offset)
+
+        def _calc_waiting(inner_bound_item: Optional[RateItem]) -> int:
             assert self.failing_rate is not None  # NOTE: silence mypy
-            lower_time_bound = item.timestamp - self.failing_rate.interval
-            upper_time_bound = inner_bound_item.timestamp
-            # +1: the window lower bound is inclusive across all backends (an
-            # item counts while timestamp >= now - interval). Returning the bare
-            # difference lands the retry exactly ON the boundary, where the item
-            # is still counted, so the re-put fails and waiting() then returns 0
-            # -> _delay_waiter busy-spins. One extra ms pushes strictly past it.
-            return upper_time_bound - lower_time_bound + 1
+            blocking = None if inner_bound_item is None else inner_bound_item.timestamp
+            return self._algorithm.retry_after(self.failing_rate, item.timestamp, blocking)
 
         async def _calc_waiting_async() -> int:
             nonlocal bound_item
@@ -116,17 +179,13 @@ class AbstractBucket(ABC):
             while isawaitable(bound_item):
                 bound_item = await bound_item
 
-            if bound_item is None:
-                # NOTE: No waiting, bucket is immediately ready
-                return 0
-
-            assert isinstance(bound_item, RateItem)
+            assert bound_item is None or isinstance(bound_item, RateItem)
             return _calc_waiting(bound_item)
 
         if isawaitable(bound_item):
             return _calc_waiting_async()
 
-        assert isinstance(bound_item, RateItem)
+        assert bound_item is None or isinstance(bound_item, RateItem)
         return _calc_waiting(bound_item)
 
     def limiter_lock(self) -> Optional[object]:  # type: ignore
@@ -179,15 +238,26 @@ class Leaker:
         self._thread = None
 
     def register(self, bucket: AbstractBucket):
-        """Register a new bucket with its associated clock"""
+        """Register a new bucket, routing it to the sync or async leak loop.
+
+        Prefers the bucket's declared ``is_async``; only falls back to the
+        side-effecting ``leak(0)`` probe when that is ``None`` (issue #305).
+        """
         assert self.sync_buckets is not None
         assert self.async_buckets is not None
 
-        try_leak = bucket.leak(0)
         bucket_id = id(bucket)
+        is_async = bucket.is_async
 
-        if iscoroutine(try_leak):
-            try_leak.close()
+        if is_async is None:
+            try_leak = bucket.leak(0)
+            if iscoroutine(try_leak):
+                try_leak.close()
+                is_async = True
+            else:
+                is_async = False
+
+        if is_async:
             self.async_buckets[bucket_id] = bucket
         else:
             self.sync_buckets[bucket_id] = bucket
@@ -359,7 +429,19 @@ class BucketFactory(ABC):
             except Exception as e:
                 logger.debug("Exception %s (%s) deleting bucket %r", type(e).__name__, e, bucket)
 
+    def owned_buckets(self) -> List[AbstractBucket]:
+        """Buckets this factory is responsible for releasing on ``close()``.
+
+        Deliberately distinct from ``get_buckets()``, which reports what the
+        Leaker currently tracks. A bucket can be owned and in use while absent
+        from that registry and it still needs closing. Subclasses that retain
+        buckets of their own should extend this.
+        """
+        return self.get_buckets()
+
     def close(self) -> None:
+        buckets = self.owned_buckets()
+
         try:
             if self._leaker is not None:
                 self._leaker.close()
@@ -367,7 +449,7 @@ class BucketFactory(ABC):
         except Exception as e:
             logger.info("Exception %s (%s) deleting bucket %r", type(e).__name__, e, self._leaker)
 
-        for bucket in self.get_buckets():
+        for bucket in buckets:
             try:
                 logger.debug("Closing bucket %s", bucket)
                 bucket.close()

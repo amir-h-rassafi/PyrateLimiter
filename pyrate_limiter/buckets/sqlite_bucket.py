@@ -10,6 +10,7 @@ from time import time, time_ns
 from typing import List, Optional, Tuple, Union
 
 from ..abstracts import AbstractBucket, Rate, RateItem
+from ..abstracts.algorithm import LogAlgorithm
 from ..clocks import AbstractClock
 from ..utils import dedicated_sqlite_clock_connection
 
@@ -28,7 +29,7 @@ class Queries:
     """
     COUNT_BEFORE_INSERT = """
     SELECT :interval{index} as interval, COUNT(*) FROM '{table}'
-    WHERE item_timestamp >= :current_timestamp - :interval{index}
+    WHERE item_timestamp >= :start{index}
     """
     PUT_ITEM = """
     INSERT INTO '{table}' (name, item_timestamp) VALUES (?, ?)
@@ -37,7 +38,7 @@ class Queries:
     DELETE FROM "{table}" WHERE rowid IN (
     SELECT rowid FROM "{table}" ORDER BY item_timestamp ASC LIMIT {count});
     """.strip()
-    COUNT_BEFORE_LEAK = """SELECT COUNT(*) FROM '{table}' WHERE item_timestamp < {current_timestamp} - {interval}"""
+    COUNT_BEFORE_LEAK = """SELECT COUNT(*) FROM '{table}' WHERE item_timestamp < {lower_bound}"""
     FLUSH = """DELETE FROM '{table}'"""
     # The below sqls are for testing only
     DROP_TABLE = "DROP TABLE IF EXISTS '{table}'"
@@ -62,6 +63,7 @@ class SQLiteBucket(AbstractBucket):
     item's timestamp wont matter here
     """
 
+    is_async = False
     rates: List[Rate]
     failing_rate: Optional[Rate]
     conn: sqlite3.Connection
@@ -70,9 +72,20 @@ class SQLiteBucket(AbstractBucket):
     lock: RLock
     use_limiter_lock: bool
 
-    def __init__(self, rates: List[Rate], conn: sqlite3.Connection, table: str, lock=None):
+    def __init__(
+        self,
+        rates: List[Rate],
+        conn: sqlite3.Connection,
+        table: str,
+        lock=None,
+        algorithm: Optional[LogAlgorithm] = None,
+    ):
         self.conn = conn
         self.table = table
+
+        if algorithm is not None:
+            self._algorithm = algorithm
+
         self.rates = rates
 
         if not lock:
@@ -99,6 +112,7 @@ class SQLiteBucket(AbstractBucket):
 
         for index, rate in enumerate(self.rates):
             parameters[f"interval{index}"] = rate.interval
+            parameters[f"start{index}"] = self._algorithm.window_start(rate, current_timestamp)
             query = Queries.COUNT_BEFORE_INSERT.format(table=self.table, index=index)
             full_query.append(query)
 
@@ -112,15 +126,24 @@ class SQLiteBucket(AbstractBucket):
             rate_limit_counts = cur.fetchall()
             cur.close()
 
-            for idx, result in enumerate(rate_limit_counts):
-                interval, count = result
-                rate = self.rates[idx]
+            # Each row is (interval, count); the UNION-of-COUNTs query returns
+            # them in ascending-interval order, matching self.rates. Verify that
+            # alignment, then defer the admit decision to the algorithm.
+            counts = []
+            for (interval, count), rate in zip(rate_limit_counts, self.rates, strict=True):
                 assert interval == rate.interval
-                space_available = rate.limit - count
+                counts.append(count)
 
-                if space_available < item.weight:
-                    self.failing_rate = rate
-                    return False
+            decision = self._algorithm.decide(
+                self.rates,
+                counts,
+                item.weight,
+                item.timestamp,
+                self._peek_timestamp,
+            )
+
+            if not self._record(item, decision):
+                return False
 
             # Bind name + timestamp as parameters; never interpolate the
             # user-supplied name into SQL (injection / quote-crash).
@@ -129,6 +152,18 @@ class SQLiteBucket(AbstractBucket):
             self.conn.executemany(query, rows).close()
             self.conn.commit()
             return True
+
+    def _peek_timestamp(self, offset: int) -> Optional[int]:
+        """Timestamp ``offset`` places from the newest item, or ``None``.
+
+        Called from inside put()'s lock hold, so the Leaker cannot delete rows
+        between the verdict and the wait.
+        """
+        cur = self.conn.execute(Queries.PEEK.format(table=self.table, count=offset))
+        row = cur.fetchone()
+        cur.close()
+
+        return None if row is None else int(row[1])
 
     def leak(self, current_timestamp: Optional[int] = None) -> int:
         """Leaking/clean up bucket"""
@@ -141,8 +176,7 @@ class SQLiteBucket(AbstractBucket):
             assert current_timestamp is not None
             query = Queries.COUNT_BEFORE_LEAK.format(
                 table=self.table,
-                interval=self.rates[-1].interval,
-                current_timestamp=current_timestamp,
+                lower_bound=self._algorithm.leak_bound(self.rates, current_timestamp),
             )
             cur = self.conn.execute(query)
             count = cur.fetchone()[0]
@@ -157,6 +191,7 @@ class SQLiteBucket(AbstractBucket):
             self.conn.execute(Queries.FLUSH.format(table=self.table)).close()
             self.conn.commit()
             self.failing_rate = None
+            self._last_wait = None
 
     def count(self) -> int:
         with self.lock:
@@ -188,7 +223,13 @@ class SQLiteBucket(AbstractBucket):
 
     @classmethod
     def init_from_file(
-        cls, rates: List[Rate], table: str = "rate_bucket", db_path: Optional[str] = None, create_new_table: bool = True, use_file_lock: bool = False
+        cls,
+        rates: List[Rate],
+        table: str = "rate_bucket",
+        db_path: Optional[str] = None,
+        create_new_table: bool = True,
+        use_file_lock: bool = False,
+        algorithm: Optional[LogAlgorithm] = None,
     ) -> "SQLiteBucket":
         if db_path is None and use_file_lock:
             raise ValueError("db_path must be specified when using use_file_lock")
@@ -243,7 +284,7 @@ class SQLiteBucket(AbstractBucket):
             cur.close()
             sqlite_connection.commit()
 
-            return cls(rates, sqlite_connection, table=table, lock=file_lock)
+            return cls(rates, sqlite_connection, table=table, lock=file_lock, algorithm=algorithm)
 
 
 class SQLiteClock(AbstractClock):

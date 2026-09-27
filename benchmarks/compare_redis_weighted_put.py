@@ -7,10 +7,8 @@ Example:
     # to a separate physical core. Adjust CPU IDs to those available on your host.
     docker run -d --rm --name pyrate-bench-redis -p 6379:6379 \
         --cpuset-cpus 0 --cpus 1 --memory 512m --memory-swap 512m redis:7
-    taskset -c 2 uv run --group all python benchmarks/compare_redis_weighted_put.py \
-        --baseline /tmp/pyrate-master \
-        --candidate /tmp/pyrate-candidate \
-        --redis-url redis://localhost:6379
+    make benchmark-redis BASELINE=/tmp/pyrate-master \
+        CANDIDATE=/tmp/pyrate-candidate BENCH_CPU=2
     docker stop pyrate-bench-redis
 
 Run on an otherwise idle Linux host. The comparison runs locally, outside CI.
@@ -162,9 +160,7 @@ def compare(args: argparse.Namespace) -> None:
         "baseline": args.baseline.resolve(),
         "candidate": args.candidate.resolve(),
     }
-    samples: dict[tuple[str, int], list[int]] = {
-        (label, weight): [] for label in checkouts for weight in args.weights
-    }
+    samples: dict[tuple[str, int], list[int]] = {(label, weight): [] for label in checkouts for weight in args.weights}
 
     redis = Redis.from_url(args.redis_url)
     redis_version = str(redis.info("server")["redis_version"])

@@ -3,13 +3,10 @@
 Example:
     git worktree add --detach /tmp/pyrate-master <before-sha>
     git worktree add --detach /tmp/pyrate-candidate <after-sha>
-    # Redis is limited to one CPU and 512 MiB by cgroups; pin the benchmark
-    # to a separate physical core. Adjust CPU IDs to those available on your host.
-    docker run -d --rm --name pyrate-bench-redis -p 6379:6379 \
-        --cpuset-cpus 0 --cpus 1 --memory 512m --memory-swap 512m redis:7
+    # Make caps Redis at one CPU and 512 MiB; use separate physical CPU cores.
+    # Adjust Redis and benchmark CPU IDs to those available on your host.
     make benchmark-redis BASELINE=/tmp/pyrate-master \
-        CANDIDATE=/tmp/pyrate-candidate BENCH_CPU=2
-    docker stop pyrate-bench-redis
+        CANDIDATE=/tmp/pyrate-candidate REDIS_CPU=0 BENCH_CPU=2
 
 Run on an otherwise idle Linux host. The comparison runs locally, outside CI.
 Use a dedicated Redis instance and trusted checkouts: workers execute code from

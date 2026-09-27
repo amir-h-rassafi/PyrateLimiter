@@ -8,8 +8,7 @@ Example:
     taskset -c 2 uv run --group all python benchmarks/compare_redis_weighted_put.py \
         --baseline /tmp/pyrate-master \
         --candidate /tmp/pyrate-candidate \
-        --redis-url redis://localhost:6379 \
-        --windows second minute hour day month
+        --redis-url redis://localhost:6379
     docker stop pyrate-bench-redis
 
 Run on an otherwise idle Linux host. The comparison runs locally, outside CI.
@@ -17,8 +16,8 @@ Use a dedicated Redis instance and trusted checkouts: workers execute code from
 both checkouts and delete their per-sample Redis keys.
 
 The key is reset before every sample, so this benchmark isolates weighted put
-latency. Window duration is reported independently from retained-set occupancy,
-which should be benchmarked separately for long-lived production buckets.
+latency. It uses a fixed one-second rate; window duration does not affect an
+empty bucket. Sustained occupancy is a separate workload.
 """
 
 from __future__ import annotations
@@ -36,13 +35,7 @@ from typing import Any
 
 DEFAULT_WEIGHTS = [1, 10, 100, 1000, 5000]
 DEFAULT_ROUNDS = 5
-WINDOWS_MS = {
-    "second": 1_000,
-    "minute": 60_000,
-    "hour": 3_600_000,
-    "day": 86_400_000,
-    "month": 2_592_000_000,
-}
+WINDOW_MS = 1_000
 
 
 def percentile(values: list[int], fraction: float) -> float:
@@ -80,8 +73,8 @@ def run_worker(args: argparse.Namespace) -> None:
 
     redis = Redis.from_url(args.redis_url)
     redis.ping()
-    key = f"benchmark:redis-weight:{args.label}:{args.window}:{args.weight}:{os.getpid()}"
-    bucket = RedisBucket.init([Rate(args.weight, args.window_ms)], redis, key)
+    key = f"benchmark:redis-weight:{args.label}:{args.weight}:{os.getpid()}"
+    bucket = RedisBucket.init([Rate(args.weight, WINDOW_MS)], redis, key)
     samples_ns: list[int] = []
 
     try:
@@ -103,7 +96,6 @@ def run_worker(args: argparse.Namespace) -> None:
         json.dumps(
             {
                 "label": args.label,
-                "window": args.window,
                 "weight": args.weight,
                 "samples_ns": samples_ns,
             }
@@ -115,7 +107,6 @@ def run_block(
     args: argparse.Namespace,
     label: str,
     checkout: Path,
-    window: str,
     weight: int,
     iterations: int,
 ) -> list[int]:
@@ -128,10 +119,6 @@ def run_block(
         str(checkout),
         "--label",
         label,
-        "--window",
-        window,
-        "--window-ms",
-        str(WINDOWS_MS[window]),
         "--weight",
         str(weight),
         "--iterations",
@@ -153,23 +140,15 @@ def render_markdown(results: dict[str, Any]) -> str:
         f"Baseline: `{results['baseline_commit'][:12]}`; candidate: `{results['candidate_commit'][:12]}`; "
         f"Redis: `{results['redis_version']}`; rounds: {results['rounds']}.",
         "",
+        "| Weight | Samples/version | Baseline median | Candidate median | Median reduction | Baseline p95 | Candidate p95 |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
-    for window in results["windows"]:
-        lines.extend(
-            [
-                f"### {window['name'].title()} window ({window['duration_ms']:,} ms)",
-                "",
-                "| Weight | Samples/version | Baseline median | Candidate median | Median reduction | Baseline p95 | Candidate p95 |",
-                "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
-            ]
+    for row in results["rows"]:
+        lines.append(
+            "| {weight} | {samples_per_version} | {baseline_median_us:.1f} us | "
+            "{candidate_median_us:.1f} us | {median_reduction_pct:+.1f}% | "
+            "{baseline_p95_us:.1f} us | {candidate_p95_us:.1f} us |".format(**row)
         )
-        for row in window["rows"]:
-            lines.append(
-                "| {weight} | {samples_per_version} | {baseline_median_us:.1f} us | "
-                "{candidate_median_us:.1f} us | {median_reduction_pct:+.1f}% | "
-                "{baseline_p95_us:.1f} us | {candidate_p95_us:.1f} us |".format(**row)
-            )
-        lines.append("")
     return "\n".join(lines)
 
 
@@ -181,8 +160,8 @@ def compare(args: argparse.Namespace) -> None:
         "baseline": args.baseline.resolve(),
         "candidate": args.candidate.resolve(),
     }
-    samples: dict[tuple[str, str, int], list[int]] = {
-        (label, window, weight): [] for label in checkouts for window in args.windows for weight in args.weights
+    samples: dict[tuple[str, int], list[int]] = {
+        (label, weight): [] for label in checkouts for weight in args.weights
     }
 
     redis = Redis.from_url(args.redis_url)
@@ -191,36 +170,26 @@ def compare(args: argparse.Namespace) -> None:
 
     for round_index in range(args.rounds):
         order = ("baseline", "candidate") if round_index % 2 == 0 else ("candidate", "baseline")
-        for window in args.windows:
-            for weight in args.weights:
-                iterations = iterations_for_weight(args, weight)
-                for label in order:
-                    samples[(label, window, weight)].extend(run_block(args, label, checkouts[label], window, weight, iterations))
-
-    windows = []
-    for window in args.windows:
-        rows = []
         for weight in args.weights:
-            baseline = samples[("baseline", window, weight)]
-            candidate = samples[("candidate", window, weight)]
-            baseline_median = statistics.median(baseline) / 1_000
-            candidate_median = statistics.median(candidate) / 1_000
-            rows.append(
-                {
-                    "weight": weight,
-                    "samples_per_version": len(baseline),
-                    "baseline_median_us": baseline_median,
-                    "candidate_median_us": candidate_median,
-                    "median_reduction_pct": (1 - candidate_median / baseline_median) * 100,
-                    "baseline_p95_us": percentile(baseline, 0.95),
-                    "candidate_p95_us": percentile(candidate, 0.95),
-                }
-            )
-        windows.append(
+            iterations = iterations_for_weight(args, weight)
+            for label in order:
+                samples[(label, weight)].extend(run_block(args, label, checkouts[label], weight, iterations))
+
+    rows = []
+    for weight in args.weights:
+        baseline = samples[("baseline", weight)]
+        candidate = samples[("candidate", weight)]
+        baseline_median = statistics.median(baseline) / 1_000
+        candidate_median = statistics.median(candidate) / 1_000
+        rows.append(
             {
-                "name": window,
-                "duration_ms": WINDOWS_MS[window],
-                "rows": rows,
+                "weight": weight,
+                "samples_per_version": len(baseline),
+                "baseline_median_us": baseline_median,
+                "candidate_median_us": candidate_median,
+                "median_reduction_pct": (1 - candidate_median / baseline_median) * 100,
+                "baseline_p95_us": percentile(baseline, 0.95),
+                "candidate_p95_us": percentile(candidate, 0.95),
             }
         )
 
@@ -229,7 +198,7 @@ def compare(args: argparse.Namespace) -> None:
         "candidate_commit": checkout_commit(checkouts["candidate"]),
         "redis_version": redis_version,
         "rounds": args.rounds,
-        "windows": windows,
+        "rows": rows,
     }
     if args.json_output:
         args.json_output.write_text(json.dumps(results, indent=2) + "\n")
@@ -243,16 +212,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--redis-url", default=os.getenv("REDIS", "redis://localhost:6379"))
     parser.add_argument("--weights", nargs="+", type=int, default=DEFAULT_WEIGHTS)
     parser.add_argument(
-        "--windows",
-        nargs="+",
-        choices=WINDOWS_MS,
-        default=list(WINDOWS_MS),
-    )
-    parser.add_argument(
         "--rounds",
         type=int,
         default=DEFAULT_ROUNDS,
-        help="repeat every window/weight comparison (default: %(default)s)",
+        help="repeat every weight comparison (default: %(default)s)",
     )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--target-members-per-round", type=int, default=120_000)
@@ -263,8 +226,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--checkout", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--label", help=argparse.SUPPRESS)
-    parser.add_argument("--window", choices=WINDOWS_MS, help=argparse.SUPPRESS)
-    parser.add_argument("--window-ms", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--weight", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--iterations", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -289,13 +250,11 @@ def parse_args() -> argparse.Namespace:
         required = (
             args.checkout,
             args.label,
-            args.window,
-            args.window_ms,
             args.weight,
             args.iterations,
         )
         if any(value is None for value in required):
-            parser.error("worker mode requires checkout, label, window, window-ms, weight, and iterations")
+            parser.error("worker mode requires checkout, label, weight, and iterations")
     elif args.baseline is None or args.candidate is None:
         parser.error("comparison mode requires baseline and candidate checkouts")
     return args
